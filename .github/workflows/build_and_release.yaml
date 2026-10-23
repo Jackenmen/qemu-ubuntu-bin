@@ -1,0 +1,130 @@
+name: Build and release
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        type: string
+        required: true
+        default: https://gitlab.com/qemu-project/qemu
+        description: "Example: https://gitlab.com/qemu-project/qemu"
+      commit:
+        type: string
+        required: true
+        default: 76fdb3373c9a27b3f50ecc9e012cbdeb90af7151
+        description: "Example: 76fdb3373c9a27b3f50ecc9e012cbdeb90af7151"
+      version:
+        type: string
+        required: true
+        default: 11.2.0-b0
+        description: "Example: 11.2.0-rc0"
+
+jobs:
+  build:
+    name: Build
+    strategy:
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+    runs-on: ${{ matrix.os }}
+    permissions: {}
+    env:
+      ARCHIVE_NAME: qemu-bin-${{ inputs.version }}-${{ matrix.os }}.tar.xz
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo sed -e 's/Types: deb/Types: deb deb-src/' -i /etc/apt/sources.list.d/* || true
+          sudo sed -e 's/# deb-src/deb-src/' -i /etc/apt/sources.list
+
+          sudo apt-get update
+          sudo apt-get install -y git build-essential flex bison
+          sudo apt-get build-dep -y --arch-only qemu
+
+      - name: Clone repo
+        env:
+          INPUTS_REPO_URL: ${{ inputs.repo_url }}
+          INPUTS_COMMIT: ${{ inputs.commit }}
+        run: |
+          echo "Cloning $INPUTS_REPO_URL from revision $INPUTS_COMMIT..."
+          git clone "$INPUTS_REPO_URL" --depth 1 --revision "$INPUTS_COMMIT"
+
+      - name: Update VERSION file
+        env:
+          INPUTS_VERSION: ${{ inputs.version }}
+        working-directory: qemu
+        run: |
+          beta_version="${INPUTS_VERSION##*-b}"
+          if [[ "$beta_version" =~ ^[0-9]+$ ]]; then
+            old_version=$(< VERSION)
+            echo "${old_version::-3}.$((70 + beta_version))" > VERSION
+          fi
+
+      - name: Build
+        working-directory: qemu
+        run: |
+          prefix="$(realpath "$(pwd)/../qemu-build")"
+          ./configure --target-list='x86_64-softmmu aarch64-softmmu' --prefix="$prefix" --disable-docs --disable-sndio
+          make install -j "$(nproc)"
+          strip "$prefix"/bin/*
+
+      - name: Create archive
+        working-directory: qemu-build
+        run: |
+          tar cJvf "$ARCHIVE_NAME" *
+          sha256sum "$ARCHIVE_NAME"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          path: qemu-build/${{ env.ARCHIVE_NAME }}
+          archive: false
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create archive
+        working-directory: artifacts
+        run: |
+          sha256sum qemu-bin-* | tee SHA256SUMS
+
+      - name: Generate attestations
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-checksums: artifacts/SHA256SUMS
+
+      - name: Make a release
+        env:
+          INPUTS_VERSION: ${{ inputs.version }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NOTES: |
+            Release created from the following commit:
+            ${{ inputs.repo_url }}/-/commit/${{ inputs.commit }}
+
+            See the `COPYING` and `LICENSE` files in the root of the repo
+            for licensing details of the QEMU project.
+
+            Artifact attestations available at:
+            ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          gh release create "$INPUTS_VERSION" artifacts/* \
+            --title "$INPUTS_VERSION" \
+            --notes "$RELEASE_NOTES" \
+            --target "$GITHUB_REF"
